@@ -5,7 +5,7 @@
 #include <string>
 #include <memory>
 
-namespace DsYaml {
+namespace ss_yaml {
 using namespace std;
 
 
@@ -13,6 +13,29 @@ using namespace std;
 
 #define CHECK(cond) do { if (!(cond)) throw std::runtime_error("failed CHECK(" #cond ")"); } while(false)
 #define FAIL(text) do { throw std::runtime_error(text); } while(false)
+
+struct Str {
+    Str(const char* s, int sz) : start(s), size(sz) {}
+    explicit Str(const char* s) : start(s), size(strlen(s)) {}
+    explicit Str(const string& s) : start(s.data()), size(s.size()) {}
+    const char* end() { return start + size; } // one after the last character
+
+    const char* start;
+    int size;
+};
+bool operator==(const Str& a, const Str& b) {
+    return a.size == b.size && memcmp(a.start, b.start, a.size) == 0;
+}
+template<typename T>
+bool operator==(const Str& a, const T& b) {
+    return operator==(a, Str(b));
+}
+bool operator<(const Str& a, const Str& b) {
+    if (a.size != b.size)
+        return a.size < b.size;
+    return memcmp(a.start, b.start, a.size) < 0;
+}
+
 
 enum ENodeType {
     NODE_MAP,
@@ -27,9 +50,10 @@ struct Node
     virtual ~Node() {}
     virtual Node& operator[](int index) { FAIL("operator[int] not implemented for this node"); }
     virtual Node& operator[](const string& key) { FAIL("operator[str] not implemented for this node"); }
+    virtual Node& operator[](const char* key) { FAIL("operator[char*] not implemented for this node"); }
     virtual Node& ofid(const string& key) { FAIL("ofid not implemented for this node"); }
     
-    virtual string& str() { FAIL("str not implemented for this node"); }
+    virtual string str() { FAIL("str not implemented for this node"); }
     virtual double dbl() { FAIL("flt not implemented for this node"); }
     virtual int len() { FAIL("len not implemented for this node"); }
 
@@ -49,11 +73,17 @@ struct Node
 
     ENodeType type;
 };
+
 struct MapNode : public Node
 {
     MapNode() : Node(NODE_MAP) {}
     virtual Node& operator[](const string& key) { 
-        auto it = v.find(key);
+        auto it = v.find(Str(key));
+        CHECK(it != v.end());
+        return *it->second;
+    }
+    virtual Node& operator[](const char* key) {
+        auto it = v.find(Str(key));
         CHECK(it != v.end());
         return *it->second;
     }
@@ -62,17 +92,18 @@ struct MapNode : public Node
         return v.size();
     }
 
-    map<string, Node*> v;
+    map<Str, Node*> v;
 };
+
 struct StrNode : public Node
 {
-    StrNode(const string& _v) : Node(NODE_STR), v(_v) {}
-    virtual string& str() { return v; }
+    StrNode(const Str& s) : Node(NODE_STR), v(s) {}
+    virtual string str() { return string(v.start, v.size); }
     virtual int len() {
-        return v.size();
+        return v.size;
     }
 
-    string v;
+    Str v;
 };
 struct NumNode : public Node
 {
@@ -107,6 +138,9 @@ bool isAlpha(char c) {
 bool isSpace(char c) {
     return c == ' ' || c == '\t';
 }
+bool isWs(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
 bool isNum(char c) {
     return c >= '0' && c <= '9';
 }
@@ -118,7 +152,7 @@ private:
     int m_pos;
     int m_size;
 
-    MapNode* m_root = nullptr;
+    Node* m_root = nullptr;
     int m_lastNewline;
     int m_lineCount;
 public:
@@ -133,7 +167,7 @@ public:
         m_lastNewline = -1; // first newline is before the start
         m_lineCount = 1;
 
-        m_root = parseMap();
+        m_root = parseNode();
     }
 
 
@@ -156,93 +190,22 @@ public:
         return true;
     }
 
-
-    MapNode* parseMap()
-    {
-        MapNode* m = new MapNode;
-        int myindent = m_pos - m_lastNewline; // include the first letter
-        while (true) // iterate key-values
-        {
-            //if (!skipWs())
-            //    break;
-            char c = m_buf[m_pos];
-            if (isAlpha(c)) {
-                if (m_pos - m_lastNewline != myindent)
-                    break;
-                int keyStart = m_pos;
-                while (isAlpha(c)) {
-                    c = m_buf[++m_pos];
-                }
-                int keyEnd = m_pos;
-                skipWs();
-                c = m_buf[m_pos];
-                CHECK(c == ':');
-                ++m_pos;  // skip :
-                skipWs();
-                string key(m_buf + keyStart, m_buf + keyEnd);
-                Node* node = parseNode();
-                m->v[key] = node;
-                skipWs();
-            }
-            else
-                break; // it's something other than a key again
-        }
-        return m;
-    }
     
     Node* parseNode()
     {
+        skipWs();
         char c = m_buf[m_pos];
-        // first check if it's a literal string of number
-        if (isAlpha(c) || isNum(c) || (c == '-' && isNum(m_buf[m_pos + 1])) ) {
-            // look ahead to see if there is a ':' - then it's a map
-            int lookpos = m_pos;
-            int inStr = true;
-            int strEnd = -1;
-            bool hasAlpha = false;
-            while (true) {
-                c = m_buf[lookpos];
-                if (inStr && (isAlpha(c) || c == '-' || isNum(c) || c == '-' || c == '.')) {  // string and keys can have hyphens or numbers in them
-                    hasAlpha |= (isAlpha(c) && c != 'e');
-                    strEnd = lookpos;
-                    ++lookpos;
-                    continue;
-                }
-                inStr = false;
-                if (isSpace(c)) {  // there can be spaces after the key and before the :
-                    ++lookpos;
-                    continue;
-                }
-                break;
-            }
-            if (c == ':')  // it's a map
-                return parseMap();
 
-            Node* n = nullptr;
-            if (hasAlpha)
-                n = new StrNode(string(m_buf + m_pos, m_buf + strEnd + 1)); // strEnd is the last one which was alpha so we want to end the string one after it
-            else {
-                char* dend = nullptr;
-                double d = strtod(m_buf + m_pos, &dend);
-                CHECK(dend == m_buf + strEnd + 1);
-                n = new NumNode(d);
-            }
-            m_pos = strEnd + 1;
-            skipWs();
-            return n;
-        }
-
-        if (c == '-') {
+        if (c == '-' && m_size - m_pos > 2 && m_buf[m_pos + 1] == ' ') {
             auto ret = new ListNode();
             int myindent = m_pos - m_lastNewline;  // include the -
             while (c == '-') {
                 if (m_pos - m_lastNewline != myindent)
                     break;  // we arrived at a line of a different list
                 ++m_pos; // skip -  
-                skipWs();
                 auto n = parseNode();
                 ret->v.push_back(n);
-                skipWs();
+                skipWs();  // skip the the next line to find the next -
                 c = m_buf[m_pos];
             }
             return ret;
@@ -250,9 +213,9 @@ public:
         if (c == '[') { // inline list syntax
             auto ret = new ListNode();
             while (true) {
-                ++m_pos; // skip - or ,
-                skipWs();
-                c = m_buf[m_pos];
+                ++m_pos; // skip ,
+                skipWs();  // there may be a space between , and next value
+                c = m_buf[m_pos];  // will be checked after the loop
                 if (c == ']') // the case of and empty list
                     break;
                 auto n = parseNode();
@@ -262,10 +225,65 @@ public:
                     break;
             }
             CHECK(c == ']');
-            ++m_pos;
+            ++m_pos; // skip ]
             return ret;
         }
-        CHECK(false);
+        // otherwise it's a literal or a map key
+        int sstart = m_pos;
+        while (true) {
+            c = m_buf[m_pos];
+            if (isWs(c) || c == ':' || c == ',' || c == ']' || c == 0) {  // literal or key can terminate with these
+                break;
+            }
+            ++m_pos;
+        }
+        Str s(m_buf + sstart, m_pos - sstart);
+
+        skipWs();  // might be spaces after key and before :
+        c = m_buf[m_pos];
+        if (c == ':')  // it's the start of a map
+        { 
+            ++m_pos; // skip :
+            MapNode* m = new MapNode;
+            int myindent = sstart - m_lastNewline; // include the first letter
+            Node* node = parseNode();  // first key was parsed, just need to value
+            m->v[s] = node;
+            while (true) // iterate key-values
+            {
+                skipWs();
+                if (m_pos - m_lastNewline != myindent)
+                    break;
+                int kstart = m_pos;
+                while (true) {
+                    c = m_buf[m_pos];
+                    if (isWs(c) || c == ':' || c == 0) {
+                        break;
+                    }
+                    ++m_pos;
+                }
+                Str k(m_buf + kstart, m_pos - kstart);
+                if (k.size == 0)
+                    break;  // end of file reached
+                skipWs();  // space after key name and before :
+                c = m_buf[m_pos];
+                CHECK(c == ':');
+                ++m_pos;  // skip :
+                Node* node = parseNode();
+                m->v[k] = node;
+            }
+            return m;
+        }
+        // it's not a map
+
+        c = m_buf[sstart];  // check if there'a a chance it's a number by how it starts
+        if (isNum(c) || c == '-' || c == '.') {
+            char* dend = nullptr;
+            double d = strtod(m_buf + sstart, &dend);
+            if (dend == s.end())
+                return new NumNode(d);
+        }
+
+        return new StrNode(s); // strEnd is the last one which was alpha so we want to end the string one after it
     }
 
 
