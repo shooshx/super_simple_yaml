@@ -51,7 +51,8 @@ struct Node
     virtual Node& operator[](int index) { FAIL("operator[int] not implemented for this node"); }
     virtual Node& operator[](const string& key) { FAIL("operator[str] not implemented for this node"); }
     virtual Node& operator[](const char* key) { FAIL("operator[char*] not implemented for this node"); }
-    virtual Node& ofid(const string& key) { FAIL("ofid not implemented for this node"); }
+    virtual Node& nodeWith(const string& name, const string& key) { FAIL("nodeWith not implemented for this node"); }
+    virtual Node* tryNodeWith(const string& name, const string& key) { FAIL("tryNodeWith not implemented for this node"); }
     
     virtual string str() { FAIL("str not implemented for this node"); }
     virtual double dbl() { FAIL("flt not implemented for this node"); }
@@ -63,7 +64,7 @@ struct Node
         CHECK(this->len() == sz);
         MatT ret;
         for (int i = 0; i < sz; ++i) {
-            DsYaml::Node& line = (*this)[i];
+            Node& line = (*this)[i];
             CHECK(line.len() == sz);
             for (int j = 0; j < sz; ++j)
                 ret(i, j) = line[j].dbl();
@@ -120,13 +121,21 @@ struct ListNode : public Node
     virtual int len() {
         return v.size();
     }
-    virtual Node& ofid(const string& id) {
+    virtual Node& nodeWith(const string& name, const string& key) {
         for (auto it = v.begin(); it != v.end(); ++it)
         {
-            if ((**it)["id"].str() == id)
+            if ((**it)[name].str() == key)
                 return **it;
         }
         FAIL("id not found");
+    }
+    virtual Node* tryNodeWith(const string& name, const string& key) { 
+        for (auto it = v.begin(); it != v.end(); ++it)
+        {
+            if ((**it)[name].str() == key)
+                return &**it;
+        }
+        return nullptr;
     }
 
     vector<Node*> v;
@@ -168,6 +177,7 @@ public:
         m_lineCount = 1;
 
         m_root = parseNode();
+        CHECK(m_pos == m_size); // check we consumed everything
     }
 
 
@@ -196,7 +206,15 @@ public:
         skipWs();
         char c = m_buf[m_pos];
 
-        if (c == '-' && m_size - m_pos > 2 && m_buf[m_pos + 1] == ' ') {
+        if (c == '&') { // node tag, just ignore the entire tag
+            while (!isWs(c) && c != 0) 
+                c = m_buf[++m_pos];
+            skipWs();
+            c = m_buf[m_pos];
+        }
+
+        // dashed list syntax, each element starts with '- ' but can also be '-\n' if the list is of lists
+        if (c == '-' && m_size - m_pos > 2 && isWs(m_buf[m_pos + 1])) {
             auto ret = new ListNode();
             int myindent = m_pos - m_lastNewline;  // include the -
             while (c == '-') {
