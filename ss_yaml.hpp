@@ -14,10 +14,12 @@ using namespace std;
 #define CHECK(cond) do { if (!(cond)) throw std::runtime_error("failed CHECK(" #cond ")"); } while(false)
 #define FAIL(text) do { throw std::runtime_error(text); } while(false)
 
+extern "C" double my_strtod(const char *string, char **endPtr);
+
 struct Str {
     Str(const char* s, int sz) : start(s), size(sz) {}
-    explicit Str(const char* s) : start(s), size(strlen(s)) {}
-    explicit Str(const string& s) : start(s.data()), size(s.size()) {}
+    explicit Str(const char* s) : start(s), size((int)strlen(s)) {}
+    explicit Str(const string& s) : start(s.data()), size((int)s.size()) {}
     const char* end() { return start + size; } // one after the last character
 
     const char* start;
@@ -38,25 +40,59 @@ bool operator<(const Str& a, const Str& b) {
 
 
 enum ENodeType {
-    NODE_MAP,
+    NODE_NONE = 0,
+    NODE_MAP = 1,
     NODE_LIST,
-    NODE_NUM,
+    NODE_NUM_DBL,
+    NODE_NUM_LONG,
+    NODE_NUM_INT,
     NODE_STR,
 };
 
-struct Node
+struct Node {
+    unsigned char type;  // ENodeType
+};
+
+struct DataNode : public Node {
+    union {
+        struct {
+            int pos;
+            int size;
+        } str;
+        double num_dbl;
+        int64_t num_long;
+        int num_int;
+    };
+};
+
+struct MapNode : public Node {
+    map<Str, Node*> v;
+};
+struct ListNode : public Node {
+    vector<Node*> v;
+};
+
+
+class Yaml;
+
+struct Accessor
 {
-    Node(ENodeType _type) : type(_type) {}
-    virtual ~Node() {}
-    virtual Node& operator[](int index) { FAIL("operator[int] not implemented for this node"); }
-    virtual Node& operator[](const string& key) { FAIL("operator[str] not implemented for this node"); }
-    virtual Node& operator[](const char* key) { FAIL("operator[char*] not implemented for this node"); }
-    virtual Node& nodeWith(const string& name, const string& key) { FAIL("nodeWith not implemented for this node"); }
-    virtual Node* tryNodeWith(const string& name, const string& key) { FAIL("tryNodeWith not implemented for this node"); }
-    
-    virtual string str() { FAIL("str not implemented for this node"); }
-    virtual double dbl() { FAIL("flt not implemented for this node"); }
-    virtual int len() { FAIL("len not implemented for this node"); }
+    Node* node;
+    Yaml* owner;
+
+    Accessor(Node* _node, Yaml* _owner) : node(_node), owner(_owner) {}
+    virtual ~Accessor() {}
+    virtual Accessor operator[](int index) { return getOp(node->type).op_sq_int(this, index); }  //FAIL("operator[int] not implemented for this node"); }
+    virtual Accessor operator[](const string& key) { return getOp(node->type).op_sq_str(this, key); } //FAIL("operator[str] not implemented for this node"); }
+    virtual Accessor operator[](const char* key) { return getOp(node->type).op_sq_chp(this, key); } //FAIL("operator[char*] not implemented for this node"); }
+    virtual Accessor nodeWith(const string& name, const string& key) { return getOp(node->type).nodeWith(this, name, key); } //FAIL("nodeWith not implemented for this node"); }
+    virtual Accessor tryNodeWith(const string& name, const string& key) { return getOp(node->type).tryNodeWith(this, name, key); } // FAIL("tryNodeWith not implemented for this node");
+
+    virtual string str() { return getOp(node->type).str(this); } // FAIL("str not implemented for this node"); }
+    virtual double dbl() { return getOp(node->type).dbl(this); } // FAIL("flt not implemented for this node"); }
+    virtual int len() { return getOp(node->type).len(this); } //FAIL("len not implemented for this node"); }
+
+    bool isNull() const { return node == nullptr; }
 
     template<typename MatT, int sz>
     MatT mat()
@@ -72,74 +108,117 @@ struct Node
         return ret;
     }
 
-    ENodeType type;
-};
 
-struct MapNode : public Node
-{
-    MapNode() : Node(NODE_MAP) {}
-    virtual Node& operator[](const string& key) { 
+    // ---------------
+    static Accessor map_sq_str(Accessor* that, const string& key) {
+        auto& v = ((MapNode*)that->node)->v;
         auto it = v.find(Str(key));
         CHECK(it != v.end());
-        return *it->second;
+        return Accessor(it->second, that->owner);
     }
-    virtual Node& operator[](const char* key) {
+    static Accessor map_sq_chp(Accessor* that, const char* key) {
+        auto& v = ((MapNode*)that->node)->v;
         auto it = v.find(Str(key));
         CHECK(it != v.end());
-        return *it->second;
+        return Accessor(it->second, that->owner);
     }
-
-    virtual int len() { 
-        return v.size();
+    static int map_len(Accessor* that) {
+        auto& v = ((MapNode*)that->node)->v;
+        return (int)v.size();
     }
-
-    map<Str, Node*> v;
-};
-
-struct StrNode : public Node
-{
-    StrNode(const Str& s) : Node(NODE_STR), v(s) {}
-    virtual string str() { return string(v.start, v.size); }
-    virtual int len() {
-        return v.size;
+    
+    // -------------
+    static Accessor list_sq_int(Accessor* that, int index) {
+        auto& v = ((ListNode*)that->node)->v;
+        return Accessor(v[index], that->owner);
     }
-
-    Str v;
-};
-struct NumNode : public Node
-{
-    NumNode(double _v) : Node(NODE_NUM), v(_v) {}
-    virtual double dbl() { return v; }
-    double v;
-};
-struct ListNode : public Node
-{
-    ListNode() : Node(NODE_LIST) {}
-    virtual Node& operator[](int index) { 
-        return *v[index];
+    static int list_len(Accessor* that) {
+        auto& v = ((ListNode*)that->node)->v;
+        return (int)v.size();
     }
-    virtual int len() {
-        return v.size();
-    }
-    virtual Node& nodeWith(const string& name, const string& key) {
-        for (auto it = v.begin(); it != v.end(); ++it)
-        {
-            if ((**it)[name].str() == key)
-                return **it;
+    static Accessor list_nodeWith(Accessor* that, const string& name, const string& key) {
+        auto& v = ((ListNode*)that->node)->v;
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            Accessor a(*it, that->owner);
+            if (a[name].str() == key)
+                return a;
         }
         FAIL("id not found");
     }
-    virtual Node* tryNodeWith(const string& name, const string& key) { 
-        for (auto it = v.begin(); it != v.end(); ++it)
-        {
-            if ((**it)[name].str() == key)
-                return &**it;
+    static Accessor list_tryNodeWith(Accessor* that, const string& name, const string& key) {
+        auto& v = ((ListNode*)that->node)->v;
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            Accessor a(*it, that->owner);
+            if (a[name].str() == key)
+                return a;
         }
-        return nullptr;
+        return Accessor(nullptr, that->owner);
+    }
+    
+    // ---------- Str
+    static string str_str(Accessor* that); // this one is defined below since it depends on Yaml class
+    static int str_len(Accessor* that) {
+        auto& s = ((DataNode*)that->node)->str;
+        return s.size;
     }
 
-    vector<Node*> v;
+    // ---------- nums
+    static double numdbl_dbl(Accessor* that) {
+        return ((DataNode*)that->node)->num_dbl;
+    }
+
+
+    struct Ops {
+        Accessor(*op_sq_int)(Accessor*, int);
+        Accessor(*op_sq_str)(Accessor*, const string&);
+        Accessor(*op_sq_chp)(Accessor*, const char*);
+        Accessor(*nodeWith)(Accessor*, const string&, const string&);
+        Accessor(*tryNodeWith)(Accessor*, const string&, const string&);
+        string(*str)(Accessor*);
+        double(*dbl)(Accessor*);
+        int(*len)(Accessor*);
+    };
+
+    static const Ops& getOp(int type) {
+        static const Ops ops[] = {
+            { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL },
+            { NULL, map_sq_str, map_sq_chp, NULL, NULL, NULL, NULL, map_len },
+            { list_sq_int, NULL, NULL, list_nodeWith, list_tryNodeWith, NULL, NULL, list_len },
+            { NULL, NULL, NULL, NULL, NULL, NULL, numdbl_dbl, NULL },
+            { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL },
+            { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL },
+            { NULL, NULL, NULL, NULL, NULL, str_str, NULL, str_len },
+        };
+        return ops[type];
+    }
+
 };
+
+
+
+
+
+
+template<typename T, int SZ>
+class Pool
+{
+public:
+    T* alloc() {
+        if (m_curFill >= SZ) {
+            m_cur = new T[SZ];
+            m_arrs.push_back(m_cur);
+            m_curFill = 0;
+        }
+        return &m_cur[m_curFill++];
+    }
+
+    vector<T*> m_arrs;
+    int m_curFill = SZ+1;
+    T* m_cur = nullptr;
+};
+
+
+
 
 bool isAlpha(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
@@ -164,17 +243,23 @@ private:
     Node* m_root = nullptr;
     int m_lastNewline;
     int m_lineCount;
+    int m_lastListSize; // heuristic for the size of the next list to reserve
+
+    friend struct Accessor;
+
+    Pool<DataNode, 1240000> m_numPool;
 public:
-    Node& root() {
-        return *m_root;
+    Accessor root() {
+        return Accessor(m_root, this);
     }
     void parse(const char* inbuf)
     {
         m_buf = inbuf;
-        m_size = strlen(inbuf);
+        m_size = (int)strlen(inbuf);
         m_pos = 0;
         m_lastNewline = -1; // first newline is before the start
         m_lineCount = 1;
+        m_lastListSize = 0;
 
         m_root = parseNode();
         CHECK(m_pos == m_size); // check we consumed everything
@@ -215,13 +300,14 @@ public:
 
         // dashed list syntax, each element starts with '- ' but can also be '-\n' if the list is of lists
         if (c == '-' && m_size - m_pos > 2 && isWs(m_buf[m_pos + 1])) {
-            auto ret = new ListNode();
+            auto ret = new ListNode;
+            ret->type = NODE_LIST;
             int myindent = m_pos - m_lastNewline;  // include the -
             while (c == '-') {
                 if (m_pos - m_lastNewline != myindent)
                     break;  // we arrived at a line of a different list
                 ++m_pos; // skip -  
-                auto n = parseNode();
+                auto *n = parseNode();
                 ret->v.push_back(n);
                 skipWs();  // skip the the next line to find the next -
                 c = m_buf[m_pos];
@@ -229,14 +315,17 @@ public:
             return ret;
         }
         if (c == '[') { // inline list syntax
-            auto ret = new ListNode();
+            auto ret = new ListNode;
+            if (m_lastListSize != 0)
+                ret->v.reserve(m_lastListSize);
+            ret->type = NODE_LIST;
             while (true) {
                 ++m_pos; // skip ,
                 skipWs();  // there may be a space between , and next value
                 c = m_buf[m_pos];  // will be checked after the loop
                 if (c == ']') // the case of and empty list
                     break;
-                auto n = parseNode();
+                auto *n = parseNode();
                 ret->v.push_back(n);
                 c = m_buf[m_pos];
                 if (c != ',')
@@ -244,6 +333,7 @@ public:
             }
             CHECK(c == ']');
             ++m_pos; // skip ]
+            m_lastListSize = (int)ret->v.size();
             return ret;
         }
         // otherwise it's a literal or a map key
@@ -263,6 +353,7 @@ public:
         { 
             ++m_pos; // skip :
             MapNode* m = new MapNode;
+            m->type = NODE_MAP;
             int myindent = sstart - m_lastNewline; // include the first letter
             Node* node = parseNode();  // first key was parsed, just need to value
             m->v[s] = node;
@@ -296,16 +387,36 @@ public:
         c = m_buf[sstart];  // check if there'a a chance it's a number by how it starts
         if (isNum(c) || c == '-' || c == '.') {
             char* dend = nullptr;
-            double d = strtod(m_buf + sstart, &dend);
-            if (dend == s.end())
-                return new NumNode(d);
+            double d = my_strtod(m_buf + sstart, &dend);
+            if (dend == s.end()) {
+             //   auto *n = new DataNode;
+                auto* n = m_numPool.alloc();
+                n->type = NODE_NUM_DBL;
+                n->num_dbl = d;
+                return n;
+            }
         }
 
-        return new StrNode(s); // strEnd is the last one which was alpha so we want to end the string one after it
+        auto* n = new DataNode;
+        n->type = NODE_STR;
+        n->str.pos = (int)(s.start - m_buf);
+        n->str.size = s.size;
+        return n; // strEnd is the last one which was alpha so we want to end the string one after it
     }
 
 
 };
+
+inline string Accessor::str_str(Accessor* that) {
+    auto& s = ((DataNode*)that->node)->str;
+    return string(that->owner->m_buf + s.pos, s.size);
+}
+
+
+
+
+
+
 
 
 
