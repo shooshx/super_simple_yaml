@@ -2,7 +2,7 @@
 A super simple parser for a YAML subset
 
 TBD - no copy parser
-- even based parser
+- event based parser
 - two passes - pass 1:count, allocate nodes array, pass 2:get data
 - data objects are small, accessor objects are proxies that are build on demand
 - data objects
